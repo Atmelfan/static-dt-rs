@@ -6,17 +6,19 @@
 //!
 
 use crate::utils::{read_fdt_u32, get_fdt_string};
-use crate::Token::Invalid;
-use core::ops::Index;
 
 pub mod utils;
 
 /// # Errors
-///
+/// Errors which can be returned by DeviceTree::new()
 ///
 #[derive(Debug)]
 pub enum Error {
-    InvalidHeader,
+
+    /// Magic does not match specification
+    InvalidMagic,
+
+    /// Last compatible version is not 16, contains read last compatible version
     UnsupportedVersion(u32),
 }
 
@@ -61,7 +63,7 @@ pub enum Token<'a> {
 impl<'a> Token<'a> {
     /// Returns a given name of this token or a representation
     ///
-    fn name(&self) -> &'a [u8]{
+    pub fn name(&self) -> &'a [u8]{
         match self {
             Token::BeginNode(_, _, name) => name,
             Token::Property(_, name, _) => name,
@@ -72,43 +74,88 @@ impl<'a> Token<'a> {
         }
     }
 
+    /// Return length of the node
+    /// If token is a property, return its length in bytes
+    /// If token is a node, return the number of properties and sub-nodes
+    ///
     pub fn len(&self) -> usize{
         match self {
+            /* If property, return its length in bytes */
             Token::Property(_, _, val) => val.len(),
-            Token::BeginNode(_, _, name) => self.into_iter().count(),
+            /* If node, return the number of properties and sub-nodes in it (single level) */
+            Token::BeginNode(_, _, _) =>
+                self.into_iter().filter(|x| match x {
+                    Token::BeginNode(_,_,_) | Token::Property(_,_,_) => true,
+                    _ => false
+                }).count(),
+            /* Not a property or node */
             _ => 0
         }
     }
 
+    /// Returns true if len() equals 0. See len() for exact behaviour.
     pub fn empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Read one byte from property at position n
+    /// Returns None if not a property or out of range
     pub fn prop_u8(&self, n: usize) -> Option<u8>{
         match self {
-            Token::Property(_, _, val) =>Some(val[n]),
+            Token::Property(_, _, val) => {
+                if n >= val.len() { return None }
+                Some(val[n])
+            },
+            /* Not a property */
             _ => None
         }
     }
 
+    /// Read one cell from property at position n
+    /// Returns None if not a property or out of range
     pub fn prop_u32(&self, n: usize) -> Option<u32>{
         match self {
             Token::Property(_, _, val) => {
+                if n*4+4 > val.len() { return None }
                 Some(utils::read_fdt_u32(val, n*4))
             },
+            /* Not a property */
             _ => None
         }
     }
 
+    /// Read one string from start of property
+    /// Returns None if not a property
+    ///
     pub fn prop_str(&self) -> Option<&'a [u8]> {
         match self {
             Token::Property(_, _, val) => {
                 utils::get_fdt_string(val, 0)
             },
+            /* Not a property */
             _ => None
         }
     }
 
+    /// Read one phandle (one cell) at position 0
+    /// Returns None if token is not a property, out of range or failed to find a matching node
+    pub fn prop_phandle(&self) -> Option<Token<'a>> {
+        match self {
+            Token::Property(dt,_, val) => {
+                /* Try to read one cell and search for its node */
+                match self.prop_u32(0) {
+                    Some(phandle) => dt.get_phandle(phandle),
+                    None => None //Out of range
+                }
+            },
+            /* Not a property */
+            _ => None
+        }
+    }
+
+    /// Find a node with `name` in this node (not recursive)
+    /// Returns None if there is no matching node.
+    ///
     pub fn get_node(&self, name: &'a [u8]) -> Option<Token<'a>>{
         for tok in self.into_iter() {
             match tok {
@@ -119,6 +166,9 @@ impl<'a> Token<'a> {
         None
     }
 
+    /// Find a property with `name` in this node (not recursive)
+    /// Returns None if there is no matching property.
+    ///
     pub fn get_prop(&self, name: &'a [u8]) -> Option<Token<'a>>{
         for tok in self.into_iter() {
             match tok {
@@ -129,13 +179,15 @@ impl<'a> Token<'a> {
         None
     }
 
-
 }
 
 impl<'a> IntoIterator for Token<'a> {
     type Item = Token<'a>;
     type IntoIter = HierarchyTokenIterator<'a>;
 
+    /// Returns a hierarchical iterator over this node
+    /// Returns a empty iterator if token is not a node.
+    ///
     fn into_iter(self) -> Self::IntoIter {
         match self {
             Token::BeginNode(dt, offs, _) => HierarchyTokenIterator::new_offs(dt, offs),
@@ -146,22 +198,26 @@ impl<'a> IntoIterator for Token<'a> {
 }
 
 /// # TokenIterator
-/// Iterates over FDT tokens (see Token) in a device tree
+/// Iterates over FDT tokens (see Token) in a device tree.
+/// Doesn't care about which level it's in.
 pub struct TokenIterator<'a> {
     dt: Option<&'a DeviceTree<'a>>,
     offs: usize
 }
 
 impl<'a> TokenIterator<'a> {
-    pub fn new(dt: &'a DeviceTree<'a>) -> Self {
+    /// Create a new iterator over root
+    fn new(dt: &'a DeviceTree<'a>) -> Self {
         TokenIterator { dt: Some(dt), offs: 0 }
     }
 
-    pub fn new_offs(dt: &'a DeviceTree<'a>, offs: usize) -> Self {
+    /// Create a new iterator starting from offset, OFFSET MUST BE ALIGNED TO A TOKEN!
+    fn new_offs(dt: &'a DeviceTree<'a>, offs: usize) -> Self {
         TokenIterator { dt: Some(dt), offs }
     }
 
-    pub fn none() -> Self {
+    /// Create a empty iterator, will immediately return None
+    fn none() -> Self {
         TokenIterator { dt: None, offs: 0 }
     }
 }
@@ -189,12 +245,12 @@ impl<'a> Iterator for TokenIterator<'a> {
                         let nameoff = read_fdt_u32(dt.structs, self.offs) as usize; self.offs += 4;
                         let name = get_fdt_string(dt.strings, nameoff).unwrap();
                         let tmp = self.offs;
-                        self.offs += (((len + 3) / 4)*4);
+                        self.offs += ((len + 3) / 4)*4;
                         Some(Token::Property(dt, name, &dt.structs[tmp..tmp+(len as usize)]))
                     },
                     4 => Some(Token::NoOperation),
                     9 => None,
-                    x => Some(Invalid(x))
+                    x => None //Some(Token::Invalid(x)) //useful for debugging
                 }
             }
             None => None
@@ -204,22 +260,25 @@ impl<'a> Iterator for TokenIterator<'a> {
 
 /// # HierarchyTokenIterator
 /// Iterates over FDT tokens but ignores token not in the current node
-/// (i.e. between a node-begin and -end pair)
+/// (i.e. between a node-begin and -end pair).
 pub struct HierarchyTokenIterator<'a> {
     tokeniter: TokenIterator<'a>,
     level: i16
 }
 
 impl<'a> HierarchyTokenIterator<'a> {
-    pub fn new(dt: &'a DeviceTree<'a>) -> Self {
+    /// See `TokenIterator::new()`
+    fn new(dt: &'a DeviceTree<'a>) -> Self {
         HierarchyTokenIterator {tokeniter: TokenIterator::new(dt), level: 0}
     }
 
-    pub fn new_offs(dt: &'a DeviceTree<'a>, offs: usize) -> Self {
+    /// See `TokenIterator::new_offs()`
+    fn new_offs(dt: &'a DeviceTree<'a>, offs: usize) -> Self {
         HierarchyTokenIterator{ tokeniter: TokenIterator::new_offs(dt, offs), level: 0 }
     }
 
-    pub fn none() -> Self {
+    /// See `TokenIterator::none()`
+    fn none() -> Self {
         HierarchyTokenIterator{ tokeniter: TokenIterator::none(), level: 0 }
     }
 }
@@ -263,8 +322,10 @@ pub struct DeviceTree<'a> {
 
 impl<'a> DeviceTree<'a> {
 
+    /// Create a new DeviceTree with `fdt` as backing buffer.
+    /// Returns Ok if header and version is correct. Respective Err() otherwise.
     ///
-    pub fn use_buffer(fdt: &'a [u8]) -> Result<DeviceTree<'a>, Error> {
+    pub fn back(fdt: &'a [u8]) -> Result<DeviceTree<'a>, Error> {
 
         let struct_offs = utils::read_fdt_u32(fdt, 8) as usize;
         let strings_offs = utils::read_fdt_u32(fdt, 12) as usize;
@@ -278,7 +339,7 @@ impl<'a> DeviceTree<'a> {
 
         /* Check the header */
         if dt.magic() != 0xD00DFEED_u32 {
-            return Err(Error::InvalidHeader)
+            return Err(Error::InvalidMagic)
         }
 
         /* Check that the compatible version is 16 */
@@ -299,6 +360,28 @@ impl<'a> DeviceTree<'a> {
     /// Returns a iterator that will iterate over all tokens in the tree
     pub fn tokens(&self) -> TokenIterator{
         TokenIterator::new(self)
+    }
+
+    pub fn get_phandle(&self, phandle: u32) -> Option<Token> {
+        /* zero is not a valid phandle */
+        if phandle == 0 { return None; }
+
+        let mut last_node = Token::Invalid(0);
+        for token in self.tokens() {
+            match token {
+                Token::BeginNode(_,_,_) => {
+                    last_node = token;
+                },
+                Token::Property(_,_,val) => {
+                    match token.prop_u32(0) {
+                        Some(x) => if x == phandle { return Some(last_node) }
+                        _ => ()
+                    }
+                },
+                _ => ()
+            }
+        }
+        None
     }
 
     /* Methods to access header information*/
